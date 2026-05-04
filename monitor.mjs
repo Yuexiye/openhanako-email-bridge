@@ -14,9 +14,25 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 
-// ── 配置 ────────────────────────────────────────────────
+// ── 加载 .env（gitignored，不上传） ───────────────────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const envFile = path.join(__dirname, ".env");
+try {
+  const lines = fs.readFileSync(envFile, "utf-8").split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const val = trimmed.slice(eqIdx + 1).trim();
+    if (key && val && !process.env[key]) {
+      process.env[key] = val;
+    }
+  }
+} catch {}
 
+// ── 配置 ────────────────────────────────────────────────
 function requireEnv(name) {
   const val = process.env[name];
   if (!val) throw new Error(`缺少环境变量 ${name}，请设置后重启`);
