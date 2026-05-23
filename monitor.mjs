@@ -176,26 +176,7 @@ async function processNewEmail(client, mailId) {
     }, null, 2));
     log("INFO", "已加入待处理队列", { pendingFile });
 
-    // 7. 立即处理——发送自动确认回复
-    const isHomeEmail = fromArr.some(f => f.includes(CONFIG.homeEmail));
-    if (isHomeEmail) {
-      log("INFO", "来自主账号的邮件，跳过自动回复", { from: fromStr });
-    } else {
-      try {
-        const safeSubject = (email.subject || "").replace(/['"]/g, "").slice(0, 80);
-        const replyBody = `您好，\n\n已收到您的邮件，我会尽快查阅并回复。\n\n感谢来信。\n\n祝好，\n${CONFIG.email}`;
-        execSync(
-          `mail-cli --profile kimilophelia compose send ` +
-          `--to "${fromStr}" ` +
-          `--subject "Re: ${safeSubject}" ` +
-          `--body "${replyBody}"`,
-          { timeout: 15000, windowsHide: true }
-        );
-        log("INFO", "自动回复已发送", { to: fromStr, subject: safeSubject });
-      } catch (e) {
-        log("WARN", "自动回复发送失败", { err: e.message });
-      }
-    }
+    // 7.（已移除自动回复——用户不希望未经同意自动回信）
 
     // 8. 标记已处理，清理待处理队列
     processed.add(mailId);

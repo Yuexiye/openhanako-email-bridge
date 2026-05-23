@@ -1,19 +1,6 @@
 # openhanako-email-bridge
 
-Hanako 邮件监听与自动回复服务。通过 ClawEmail WebSocket Push 实时接收新邮件，存档并发送自动确认回复。事件驱动，无需轮询。
-码放这儿了，自取：
-
-CLAW2860DD50A3D6
-
-CLAW3CD4B6A418A5
-
-CLAWB852ED898A5D
-
-CLAW53BFB78087F2
-
-CLAW2DA5FC020035（已用）
-
-已用的请说一声
+Hanako 邮件监听服务。通过 ClawEmail WebSocket Push 实时接收新邮件通知，存档到本地并弹出桌面通知。事件驱动，无需轮询。
 
 ## 架构
 
@@ -22,14 +9,15 @@ CLAW2DA5FC020035（已用）
                                           ↓
                                    存档到 data/
                                           ↓
-                                   发送自动回复
-                                          ↓
                                    桌面通知
+                                          ↓
+                                   hanako 定时处理
 ```
 
 - **monitor.mjs**：持久化守护进程（PM2），WebSocket 实时接收邮件推送
 - 启动时自动扫描未读邮件，避免遗漏
-- 来自主账号的邮件不触发自动回复
+- 所有配置通过 `.env` 注入，不硬编码凭据
+- 不自动回复，新邮件进入待处理队列由 hanako 定时巡检
 
 ## 快速开始
 
