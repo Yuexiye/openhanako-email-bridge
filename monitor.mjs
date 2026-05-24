@@ -16,7 +16,6 @@ import { MailClient } from "@clawemail/node-sdk";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execSync } from "node:child_process";
 import notifier from "node-notifier";
 
 // ── 加载 .env（使用 dotenv，支持引号、注释、转义） ───────
