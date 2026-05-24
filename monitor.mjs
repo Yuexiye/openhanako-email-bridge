@@ -82,7 +82,8 @@ function log(level, msg, data = null) {
   const ts = new Date().toISOString();
   const entry = data ? `[${ts}] [${level}] ${msg} ${JSON.stringify(data)}` : `[${ts}] [${level}] ${msg}`;
   console.log(entry);
-  try { fs.appendFileSync(logFile, entry + "\n"); } catch {}
+  // 文件日志已移除，改由 PM2 接管日志轮转（避免外接盘 IO 导致掉盘）
+  // 查看日志：pm2 logs email-monitor
 }
 
 // ── 已处理记录 ─────────────────────────────────────────
