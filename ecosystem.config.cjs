@@ -1,6 +1,7 @@
 // PM2 生态系统配置 — email-monitor
 // 启动：pm2 start ecosystem.config.cjs
 // 保存：pm2 save
+// 日志轮转由 pm2-logrotate 模块管理，此处不配置 max_size 避免冲突
 
 module.exports = {
   apps: [{
@@ -10,15 +11,12 @@ module.exports = {
     // 日志由 PM2 接管，存 C 盘避免外接盘 IO
     out_file: "C:/Users/Administrator/.pm2/logs/email-monitor-out.log",
     error_file: "C:/Users/Administrator/.pm2/logs/email-monitor-error.log",
-    // 日志轮转：单文件 50MB，保留 3 个历史文件
-    max_size: "50M",
+    // 轮转由 pm2-logrotate 全局管理，不在此配置 max_size
     max_restarts: 10,
-    // 异常退出后等 5 秒再重启，避免疯狂刷日志
+    // 异常退出后等 5 秒再重启
     restart_delay: 5000,
-    // 如果 60 秒内重启超过 10 次，停止重启
     min_uptime: "10s",
     max_memory_restart: "200M",
-    // 环境变量从 .env 加载
     env: {
       NODE_ENV: "production",
     },

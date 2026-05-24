@@ -4,7 +4,7 @@
  * 通过 ClawEmail WebSocket Push 实时接收新邮件通知（支持多账号），
  * 保存邮件内容到本地存档。事件驱动，无需 cron 轮询。
  * 
- * 运行方式：pm2 start monitor.mjs --name "email-monitor"
+ * 运行方式：pm2 start ecosystem.config.cjs --name "email-monitor"
  * 
  * 多账号配置方式（.env）：
  *   CLAWEMAIL_API_KEY=...          # 共享 API Key
@@ -17,24 +17,35 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
+import notifier from "node-notifier";
 
-// ── 加载 .env（gitignored，不上传） ───────────────────
+// ── 加载 .env（使用 dotenv，支持引号、注释、转义） ───────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const envFile = path.join(__dirname, ".env");
 try {
-  const lines = fs.readFileSync(envFile, "utf-8").split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim();
-    if (key && val && !process.env[key]) {
-      process.env[key] = val;
+  const dotenv = await import("dotenv");
+  dotenv.config({ path: path.join(__dirname, ".env") });
+} catch {
+  // dotenv 未安装时 fallback 到简单解析
+  const envFile = path.join(__dirname, ".env");
+  try {
+    const lines = fs.readFileSync(envFile, "utf-8").split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      let val = trimmed.slice(eqIdx + 1).trim();
+      // 去除引号
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (key && val && !process.env[key]) {
+        process.env[key] = val;
+      }
     }
-  }
-} catch {}
+  } catch {}
+}
 
 // ── 配置 ────────────────────────────────────────────────
 function requireEnv(name) {
@@ -54,7 +65,6 @@ const EXTRA_EMAILS = (process.env.CLAWEMAIL_EXTRA_ADDRESSES || "")
 const ACCOUNTS = [
   { id: "default", email: PRIMARY_EMAIL },
   ...EXTRA_EMAILS.map(email => {
-    // 从邮箱前缀提取 id（如 kimilophelia.roxy → roxy）
     const prefix = email.split("@")[0];
     const id = prefix.includes(".") ? prefix.split(".").pop() : prefix;
     return { id, email };
@@ -64,64 +74,80 @@ const ACCOUNTS = [
 const CONFIG = {
   apiKey: API_KEY,
   homeEmail: process.env.CLAWEMAIL_HOME_EMAIL || "",
-  logDir: path.join(__dirname, "logs"),
   dataDir: path.join(__dirname, "data"),
+  // Token 刷新失败保护
+  maxTokenRetries: 5,
+  tokenRetryDelayMs: 5000,
+  // 重连保护
+  maxReconnectRetries: 10,
+  reconnectBaseDelayMs: 2000,
 };
 
 // ── 初始化 ─────────────────────────────────────────────
-fs.mkdirSync(CONFIG.logDir, { recursive: true });
 fs.mkdirSync(CONFIG.dataDir, { recursive: true });
 
 const PENDING_DIR = path.join(CONFIG.dataDir, "_pending");
-const PROCESSED_FILE = path.join(CONFIG.dataDir, "_processed.json");
 fs.mkdirSync(PENDING_DIR, { recursive: true });
 
 // ── 日志 ────────────────────────────────────────────────
-const logFile = path.join(CONFIG.logDir, `email-${new Date().toISOString().slice(0, 10)}.log`);
 function log(level, msg, data = null) {
   const ts = new Date().toISOString();
   const entry = data ? `[${ts}] [${level}] ${msg} ${JSON.stringify(data)}` : `[${ts}] [${level}] ${msg}`;
   console.log(entry);
   // 文件日志已移除，改由 PM2 接管日志轮转（避免外接盘 IO 导致掉盘）
-  // 查看日志：pm2 logs email-monitor
 }
 
-// ── 已处理记录 ─────────────────────────────────────────
-function getProcessedSet() {
-  try { return new Set(JSON.parse(fs.readFileSync(PROCESSED_FILE, "utf-8"))); } catch { return new Set(); }
+// ── 已处理记录（按账号分片，避免并发冲突） ──────────────
+function getProcessedFile(accountId) {
+  return path.join(CONFIG.dataDir, `_processed_${accountId}.json`);
 }
-function saveProcessedSet(set) {
-  fs.writeFileSync(PROCESSED_FILE, JSON.stringify([...set]));
+
+function getProcessedSet(accountId) {
+  try { return new Set(JSON.parse(fs.readFileSync(getProcessedFile(accountId), "utf-8"))); } catch { return new Set(); }
+}
+
+function saveProcessedSet(accountId, set) {
+  fs.writeFileSync(getProcessedFile(accountId), JSON.stringify([...set]));
 }
 
 // ── 验证码提取 ────────────────────────────────────────
 function extractCode(text) {
-  // 优先匹配「验证码(是|为|：|:)」后面的数字串
   const nearMatch = text.match(/验证码[是为：:]\s*(\d{4,8})/);
   if (nearMatch) return nearMatch[1];
-  // 其次匹配任何独立的 4-8 位数字（前后非数字）
   const anyMatch = text.match(/(?<!\d)(\d{4,8})(?!\d)/);
   return anyMatch ? anyMatch[1] : null;
 }
 
-// ── 桌面通知 ───────────────────────────────────────────
+// ── 桌面通知（使用 node-notifier，避免命令注入） ────────
 function desktopNotify(title, body) {
   try {
-    const safeTitle = title.replace(/['"]/g, "").slice(0, 60);
-    const safeBody = body.replace(/['"]/g, "").slice(0, 120);
-    const psCmd = `powershell -Command "& {Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('${safeBody}','📬 ${safeTitle}','OK','Information')}"`;
-    execSync(psCmd, { timeout: 3000, windowsHide: true });
+    notifier.notify({
+      title: `📬 ${title.slice(0, 60)}`,
+      message: body.slice(0, 200),
+      sound: false,
+      wait: false,
+    });
   } catch (e) {
     log("WARN", "桌面通知发送失败", { err: e.message });
   }
 }
 
-// ── 邮件处理 ────────────────────────────────────────────
-async function processNewEmail(client, mailId, accountEmail) {
-  log("INFO", "收到新邮件通知", { mailId });
+// ── 延迟函数 ───────────────────────────────────────────
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-  // 去重
-  const processed = getProcessedSet();
+// ── 指数退避 ───────────────────────────────────────────
+function exponentialBackoff(attempt, baseDelay) {
+  return Math.min(baseDelay * Math.pow(2, attempt), 60000); // 最大 60 秒
+}
+
+// ── 邮件处理 ────────────────────────────────────────────
+async function processNewEmail(client, mailId, accountEmail, accountId) {
+  log("INFO", "收到新邮件通知", { mailId, account: accountId });
+
+  // 去重（按账号分片）
+  const processed = getProcessedSet(accountId);
   if (processed.has(mailId)) { log("INFO", "跳过已处理邮件"); return; }
 
   try {
@@ -137,12 +163,11 @@ async function processNewEmail(client, mailId, accountEmail) {
     const fromArr = Array.isArray(email.from) ? email.from : [email.from || ""];
     if (fromArr.some(f => f.includes(accountEmail))) {
       log("INFO", "跳过自己发出的邮件", { accountEmail });
-      processed.add(mailId); saveProcessedSet(processed);
+      processed.add(mailId); saveProcessedSet(accountId, processed);
       return;
     }
 
     // 3. 跳过系统通知（noreply、verify 等）
-    //    白名单：标题含"验证码"/"verification code"的邮件放行，不跳过
     const fromStr = fromArr.join(" ");
     const subjectStr = email.subject || "";
     const textContent = email.text?.content || email.html?.content || "";
@@ -151,7 +176,7 @@ async function processNewEmail(client, mailId, accountEmail) {
         /noreply@|no-reply@|notifications@/i.test(fromStr) ||
         /verify your email|please verify/i.test(subjectStr))) {
       log("INFO", "跳过系统通知邮件");
-      processed.add(mailId); saveProcessedSet(processed);
+      processed.add(mailId); saveProcessedSet(accountId, processed);
       return;
     }
 
@@ -197,15 +222,13 @@ async function processNewEmail(client, mailId, accountEmail) {
     }, null, 2));
     log("INFO", "已加入待处理队列", { pendingFile });
 
-    // 7.（已移除自动回复——用户不希望未经同意自动回信）
-
-    // 8. 标记已处理，清理待处理队列
+    // 7. 标记已处理，清理待处理队列
     processed.add(mailId);
-    saveProcessedSet(processed);
+    saveProcessedSet(accountId, processed);
     try { fs.unlinkSync(pendingFile); } catch {}
     log("INFO", "邮件处理完成", { mailId });
 
-    // 9. 桌面通知（按邮件类型显示不同内容）
+    // 8. 桌面通知
     const senderName = fromStr.split("<")[0].trim() || "新邮件";
     let notifyBody;
     if (isCodeWhitelist && textContent) {
@@ -226,7 +249,7 @@ async function processNewEmail(client, mailId, accountEmail) {
   }
 
   // 确保已处理记录持久化
-  try { saveProcessedSet(getProcessedSet()); } catch {}
+  try { saveProcessedSet(accountId, getProcessedSet(accountId)); } catch {}
 }
 
 // ── 启动时扫描已有未读邮件 ──────────────────────
@@ -237,40 +260,101 @@ async function scanExistingUnread(client) {
     if (unread.length === 0) { log("INFO", "没有未读邮件"); return; }
     log("INFO", "发现未读邮件", { count: unread.length });
     for (const msg of unread) {
-      await processNewEmail(client, msg.id);
+      await processNewEmail(client, msg.id, client.user, client.accountId);
     }
   } catch (e) {
     log("WARN", "扫描未读邮件失败", { err: e.message });
   }
 }
 
-// ── 启动单个账号的监听 ─────────────────────────────
+// ── 启动单个账号的监听（含重连逻辑） ────────────────────
 async function startAccount(account) {
-  log("INFO", `[${account.id}] 正在连接 ${account.email} ...`);
+  let tokenRetryCount = 0;
+  let reconnectRetryCount = 0;
 
-  const client = new MailClient({
-    user: account.email, apiKey: CONFIG.apiKey,
-    logger: {
-      info: (msg, data) => log("WS", `[${account.id}] ${msg}`, data && typeof data === "object" ? data : { msg: data }),
-      warn: (msg, data) => log("WS_WARN", `[${account.id}] ${msg}`, data && typeof data === "object" ? data : { msg: data }),
-      error: (msg, data) => log("WS_ERROR", `[${account.id}] ${msg}`, data && typeof data === "object" ? data : { msg: data }),
-    },
-  });
+  async function connectWithRetry() {
+    while (true) {
+      try {
+        log("INFO", `[${account.id}] 正在连接 ${account.email} ...`);
 
-  await client.getAccessToken();
-  log("INFO", `[${account.id}] MailClient 验证通过`);
+        const client = new MailClient({
+          user: account.email,
+          apiKey: CONFIG.apiKey,
+          logger: {
+            info: (msg, data) => log("WS", `[${account.id}] ${msg}`, data && typeof data === "object" ? data : { msg: data }),
+            warn: (msg, data) => log("WS_WARN", `[${account.id}] ${msg}`, data && typeof data === "object" ? data : { msg: data }),
+            error: (msg, data) => log("WS_ERROR", `[${account.id}] ${msg}`, data && typeof data === "object" ? data : { msg: data }),
+          },
+        });
 
-  client.ws.onMessage(async (notification) => {
-    if (notification?.mailId) await processNewEmail(client, notification.mailId, account.email);
-  });
-  client.ws.onDisconnect((reason) => log("WARN", `[${account.id}] WebSocket 断开`, { reason }));
+        // 挂载账号标识，方便后续使用
+        client.accountId = account.id;
 
-  await client.ws.connect();
-  log("INFO", `[${account.id}] ✅ WebSocket 推送已连接`);
+        // Token 获取（带重试保护）
+        try {
+          await client.getAccessToken();
+          tokenRetryCount = 0; // 重置计数器
+          log("INFO", `[${account.id}] MailClient 验证通过`);
+        } catch (e) {
+          tokenRetryCount++;
+          if (tokenRetryCount > CONFIG.maxTokenRetries) {
+            log("ERROR", `[${account.id}] Token 获取失败超过上限 (${CONFIG.maxTokenRetries} 次)，退出进程`, { err: e.message });
+            process.exit(1);
+          }
+          const backoff = exponentialBackoff(tokenRetryCount, CONFIG.tokenRetryDelayMs);
+          log("WARN", `[${account.id}] Token 获取失败 (第 ${tokenRetryCount} 次)，${backoff}ms 后重试...`);
+          await delay(backoff);
+          continue;
+        }
 
-  await scanExistingUnread(client);
+        // 消息处理
+        client.ws.onMessage(async (notification) => {
+          if (notification?.mailId) {
+            await processNewEmail(client, notification.mailId, account.email, account.id);
+          }
+        });
 
-  return client;
+        // 断开重连（指数退避 + 上限）
+        client.ws.onDisconnect(async (reason) => {
+          log("WARN", `[${account.id}] WebSocket 断开: ${reason}`);
+          reconnectRetryCount++;
+
+          if (reconnectRetryCount > CONFIG.maxReconnectRetries) {
+            log("ERROR", `[${account.id}] 重连次数超过上限 (${CONFIG.maxReconnectRetries} 次)，退出进程`);
+            process.exit(1);
+          }
+
+          const backoff = exponentialBackoff(reconnectRetryCount, CONFIG.reconnectBaseDelayMs);
+          log("INFO", `[${account.id}] 将在 ${backoff}ms 后尝试重连 (第 ${reconnectRetryCount}/${CONFIG.maxReconnectRetries} 次)...`);
+          await delay(backoff);
+
+          try {
+            await client.ws.connect();
+            reconnectRetryCount = 0; // 连接成功后重置
+            log("INFO", `[${account.id}] 重连成功`);
+          } catch (e) {
+            log("ERROR", `[${account.id}] 重连失败`, { err: e.message });
+            // 触发下一次 onDisconnect 循环
+          }
+        });
+
+        await client.ws.connect();
+        reconnectRetryCount = 0;
+        log("INFO", `[${account.id}] ✅ WebSocket 推送已连接`);
+
+        await scanExistingUnread(client);
+
+        return client;
+
+      } catch (e) {
+        log("ERROR", `[${account.id}] 连接失败`, { err: e.message });
+        const backoff = exponentialBackoff(reconnectRetryCount, CONFIG.reconnectBaseDelayMs);
+        await delay(backoff);
+      }
+    }
+  }
+
+  return connectWithRetry();
 }
 
 // ── 主函数 ──────────────────────────────────────────────
@@ -279,29 +363,49 @@ async function main() {
   log("INFO", `hanako 邮件监听服务启动`);
   log("INFO", `账号数: ${ACCOUNTS.length}`, { accounts: ACCOUNTS.map(a => a.id) });
 
+  // 多账号并行启动，互不阻塞
+  const startResults = await Promise.allSettled(
+    ACCOUNTS.map(account => startAccount(account))
+  );
+
   const clients = [];
-
-  try {
-    for (const account of ACCOUNTS) {
-      const client = await startAccount(account);
-      clients.push(client);
+  for (let i = 0; i < startResults.length; i++) {
+    const result = startResults[i];
+    if (result.status === "fulfilled") {
+      clients.push(result.value);
+      log("INFO", `[${ACCOUNTS[i].id}] 启动成功`);
+    } else {
+      log("ERROR", `[${ACCOUNTS[i].id}] 启动失败`, { err: result.reason });
     }
+  }
 
-    process.on("SIGINT", () => gracefulShutdown(clients));
-    process.on("SIGTERM", () => gracefulShutdown(clients));
-    process.on("uncaughtException", (e) => log("ERROR", "未捕获异常", { err: e.message }));
-
-    async function gracefulShutdown(allClients) {
-      log("INFO", "正在停止服务...");
-      for (const c of allClients) {
-        try { c.ws.disconnect(); } catch {}
-      }
-      log("INFO", "服务已停止");
-      process.exit(0);
-    }
-  } catch (e) {
-    log("ERROR", "服务启动失败", { err: e.message, stack: e.stack?.slice(0, 500) });
+  if (clients.length === 0) {
+    log("ERROR", "所有账号启动失败，退出");
     process.exit(1);
+  }
+
+  // 信号处理
+  process.on("SIGINT", gracefulShutdown);
+  process.on("SIGTERM", gracefulShutdown);
+
+  // 未捕获异常：打日志后退出，让 PM2 重启
+  process.on("uncaughtException", (e) => {
+    log("ERROR", "未捕获异常", { err: e.message, stack: e.stack?.slice(0, 500) });
+    process.exit(1);
+  });
+
+  // 未处理的 Promise 拒绝
+  process.on("unhandledRejection", (reason, promise) => {
+    log("ERROR", "未处理的 Promise 拒绝", { reason: String(reason) });
+  });
+
+  async function gracefulShutdown() {
+    log("INFO", "正在停止服务...");
+    for (const c of clients) {
+      try { c.ws.disconnect(); } catch {}
+    }
+    log("INFO", "服务已停止");
+    process.exit(0);
   }
 }
 
