@@ -10,6 +10,8 @@
  *   CLAWEMAIL_API_KEY=...          # 共享 API Key
  *   CLAWEMAIL_ADDRESS=...          # 主账号
  *   CLAWEMAIL_EXTRA_ADDRESSES=...  # 额外账号，逗号分隔
+ *   EMAIL_IDENTITY_MAP=...         # 访客意识映射，addr=identity,addr=identity
+ *   EMAIL_INTERNAL_CONTACTS=...    # 内部联系人，逗号分隔
  */
 
 import { MailClient } from "@clawemail/node-sdk";
@@ -17,6 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import notifier from "node-notifier";
+import { buildFromEnv } from "./identity.mjs";
 
 // ── 加载 .env（使用 dotenv，支持引号、注释、转义） ───────
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -80,6 +83,18 @@ const CONFIG = {
   // 重连保护
   maxReconnectRetries: 10,
   reconnectBaseDelayMs: 2000,
+  // 访客意识
+  awareness: (() => {
+    const awareness = buildFromEnv();
+    // 兜底：把 ACCOUNTS 里的地址也自动纳入映射（如果 EMAIL_IDENTITY_MAP 没配）
+    for (const acc of ACCOUNTS) {
+      const lower = acc.email.toLowerCase();
+      if (!awareness.map.has(lower)) {
+        awareness.map.set(lower, acc.id.toLowerCase());
+      }
+    }
+    return awareness;
+  })(),
 };
 
 // ── 初始化 ─────────────────────────────────────────────
@@ -93,7 +108,6 @@ function log(level, msg, data = null) {
   const ts = new Date().toISOString();
   const entry = data ? `[${ts}] [${level}] ${msg} ${JSON.stringify(data)}` : `[${ts}] [${level}] ${msg}`;
   console.log(entry);
-  // 文件日志已移除，改由 PM2 接管日志轮转（避免外接盘 IO 导致掉盘）
 }
 
 // ── 已处理记录（按账号分片，避免并发冲突） ──────────────
@@ -158,20 +172,43 @@ async function processNewEmail(client, mailId, accountEmail, accountId) {
       hasAttachments: !!email.attachments?.length,
     });
 
-    // 2. 跳过自己发出的邮件
+    // 2. 访客意识路由（按收件人身份分流 + 对外意识）
+    const awareness = CONFIG.awareness;
+    const { identity, rules, isExternal } = awareness.route(email, accountEmail);
+    log("INFO", "访客意识路由", { identity, priority: rules.priority, isExternal });
+
+    // 3. 对外意识：外部访客隐私过滤
+    let scrubText = null;
+    if (isExternal) {
+      scrubText = awareness.scrub(email.text?.content || email.html?.content || "");
+      log("INFO", "对外意识：已启用隐私脱敏", { identity });
+    }
+
+    // 4. 跳过自己发出的邮件
     const fromArr = Array.isArray(email.from) ? email.from : [email.from || ""];
     if (fromArr.some(f => f.includes(accountEmail))) {
-      log("INFO", "跳过自己发出的邮件", { accountEmail });
+      log("INFO", "跳过自己发出的邮件", { accountEmail, identity });
       processed.add(mailId); saveProcessedSet(accountId, processed);
       return;
     }
 
-    // 3. 跳过系统通知（noreply、verify 等）
     const fromStr = fromArr.join(" ");
     const subjectStr = email.subject || "";
     const textContent = email.text?.content || email.html?.content || "";
+    const effectiveText = scrubText || textContent;
     const isCodeWhitelist = /验证码|verification code|verify code/i.test(subjectStr);
-    if (!isCodeWhitelist && (
+    const isSystemNotification = /noreply@|no-reply@|notifications@/i.test(fromStr) ||
+                                  /verify your email|please verify/i.test(subjectStr);
+
+    // 5. 对外部系统通知（非验证码）直接跳过
+    if (isExternal && isSystemNotification && !isCodeWhitelist) {
+      log("INFO", "对外部系统通知，跳过", { identity });
+      processed.add(mailId); saveProcessedSet(accountId, processed);
+      return;
+    }
+
+    // 6. 内部邮件的系统通知跳过逻辑保持不变
+    if (!isExternal && !isCodeWhitelist && (
         /noreply@|no-reply@|notifications@/i.test(fromStr) ||
         /verify your email|please verify/i.test(subjectStr))) {
       log("INFO", "跳过系统通知邮件");
@@ -179,21 +216,27 @@ async function processNewEmail(client, mailId, accountEmail, accountId) {
       return;
     }
 
-    // 4. 保存邮件到本地存档
+    // 7. 保存邮件到本地存档（含身份标签 + 对外意识）
     const safeId = mailId.replace(/[^a-zA-Z0-9_-]/g, "_");
     const emailDir = path.join(CONFIG.dataDir, safeId);
     fs.mkdirSync(emailDir, { recursive: true });
     fs.writeFileSync(path.join(emailDir, "email.json"), JSON.stringify({
       mailId, from: email.from, to: email.to,
       subject: email.subject, date: email.date,
-      textContent,
+      textContent,                  // 原始文本（本地完整保留）
+      scrubbedText: scrubText,      // 脱敏文本（对外部邮件）
       hasHtml: !!email.html?.content,
+      identity,
+      identityRules: rules,
+      isExternal,
+      replyDecision: rules.shouldAutoReply ? "auto" : (rules.requireReply ? "manual" : "none"),
+      autoTags: rules.autoTag,
       attachments: email.attachments?.map(a => ({
         id: a.id, filename: a.filename, contentType: a.contentType, size: a.size
       })),
     }, null, 2));
 
-    // 5. 下载附件
+    // 8. 下载附件
     if (email.attachments?.length) {
       for (const att of email.attachments) {
         try {
@@ -206,42 +249,53 @@ async function processNewEmail(client, mailId, accountEmail, accountId) {
       }
     }
 
-    // 6. 写入待处理队列（等 hanako 来取）
+    // 9. 写入待处理队列（等 hanako 来取）
     const pendingFile = path.join(PENDING_DIR, `${safeId}.json`);
     fs.writeFileSync(pendingFile, JSON.stringify({
       mailId, safeId,
       from: fromStr,
       subject: email.subject,
       date: email.date,
-      textContent,
-      textPreview: textContent.slice(0, 200),
+      textContent,                  // 原始
+      scrubbedText: scrubText,      // 脱敏（外部邮件）
+      textPreview: effectiveText.slice(0, 200),
+      identity,
+      identityRules: rules,
+      isExternal,
+      replyDecision: rules.shouldAutoReply ? "auto" : (rules.requireReply ? "manual" : "none"),
+      autoTags: rules.autoTag,
       emailDir,
       hasAttachments: !!(email.attachments?.length),
       receivedAt: new Date().toISOString(),
     }, null, 2));
-    log("INFO", "已加入待处理队列", { pendingFile });
+    log("INFO", "已加入待处理队列", { pendingFile, replyDecision: rules.shouldAutoReply ? "auto" : (rules.requireReply ? "manual" : "none") });
 
-    // 7. 标记已处理，清理待处理队列
+    // 10. 标记已处理，清理待处理队列
     processed.add(mailId);
     saveProcessedSet(accountId, processed);
     try { fs.unlinkSync(pendingFile); } catch {}
-    log("INFO", "邮件处理完成", { mailId });
+    log("INFO", "邮件处理完成", { mailId, replyDecision: rules.shouldAutoReply ? "auto" : (rules.requireReply ? "manual" : "none") });
 
-    // 8. 桌面通知
+    // 11. 桌面通知（身份感知 + 对外意识脱敏）
     const senderName = fromStr.split("<")[0].trim() || "新邮件";
     let notifyBody;
+    const previewSource = isExternal ? (scrubText || textContent) : textContent;
     if (isCodeWhitelist && textContent) {
       const code = extractCode(textContent);
       notifyBody = code
         ? `验证码：${code}`
         : `📧 ${email.subject || "(无主题)"}`;
-    } else if (textContent) {
-      const preview = textContent.replace(/\s+/g, " ").trim().slice(0, 80);
+    } else if (previewSource) {
+      const preview = previewSource.replace(/\s+/g, " ").trim().slice(0, 80);
       notifyBody = `${email.subject || "(无主题)"}\n${preview}`;
     } else {
       notifyBody = `${email.subject || "(无主题)"}`;
     }
-    desktopNotify(senderName, notifyBody);
+
+    // 身份感知：为通知加上身份前缀 + 外部访客标记
+    const identityBadge = identity !== "unknown" ? `[${identity}]` : "[外部]";
+    const externalBadge = isExternal ? "🔒" : "";
+    desktopNotify(`${externalBadge}${identityBadge} ${senderName}`, notifyBody);
 
   } catch (e) {
     log("ERROR", "处理邮件失败", { mailId, err: e.message, stack: e.stack?.slice(0, 200) });
@@ -361,6 +415,8 @@ async function main() {
   log("INFO", "=".repeat(50));
   log("INFO", `hanako 邮件监听服务启动`);
   log("INFO", `账号数: ${ACCOUNTS.length}`, { accounts: ACCOUNTS.map(a => a.id) });
+  log("INFO", "访客意识映射", { map: Object.fromEntries(CONFIG.awareness.map) });
+  log("INFO", "内部联系人", { contacts: Array.from(CONFIG.awareness.internalContacts) });
 
   // 多账号并行启动，互不阻塞
   const startResults = await Promise.allSettled(
