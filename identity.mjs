@@ -15,22 +15,22 @@ class PrivacyScrubber {
     // 本地路径模式
     this.pathPatterns = [
       /[A-Za-z]:\\[^\s]+/g,           // C:\Users\...
-      /\/[A-Za-z0-9_\-\.\/]+/g,      # /home/user/...
-      /~\/([^\s]+)/g,                  # ~/...
+      /\/[A-Za-z0-9_\-\.\/]+/g,      // /home/user/...
+      /~\/([^\s]+)/g,                  // ~/...
       /\[redacted\]/g,
     ];
     // 凭证模式
     this.credentialPatterns = [
       /(?:api[_-]?key|apikey|token|secret|password)\s*[:=]\s*[^\s]+/gi,
-      /sk-[a-zA-Z0-9]{20,}/g,         # OpenAI style keys
-      /ck_[a-zA-Z0-9]+/g,             # ClawEmail keys
-      /\b\d{4,8}\b/g,                  # 验证码/数字（谨慎处理）
+      /sk-[a-zA-Z0-9]{20,}/g,         // OpenAI style keys
+      /ck_[a-zA-Z0-9]+/g,             // ClawEmail keys
+      /\b\d{4,8}\b/g,                  // 验证码/数字（谨慎处理）
     ];
     // 个人信息模式
     this.personalPatterns = [
-      /[\w\.-]+@[\w\.-]+\.\w+/g,      # 邮箱
-      /1[3-9]\d{9}/g,                  # 手机号
-      /\b\d{18}\b/g,                   # 身份证号
+      /[\w\.-]+@[\w\.-]+\.\w+/g,      // 邮箱
+      /1[3-9]\d{9}/g,                  // 手机号
+      /\b\d{18}\b/g,                   // 身份证号
     ];
   }
 
